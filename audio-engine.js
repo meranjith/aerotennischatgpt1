@@ -1,7 +1,7 @@
 function clamp(x,a,b){return Math.max(a,Math.min(b,x));}
 
 export class AudioEngine {
-  constructor(){this.ctx=null;this.master=null;this.ambient=null;this.current=null;this.activeVoice=0;}
+  constructor(){this.ctx=null;this.master=null;this.ambient=null;this.current=null;this.activeVoice=0;this._boundResume=()=>this._resumeIfNeeded();}
 
   async init(){
     if(this.ctx){if(this.ctx.state==='suspended') await this.ctx.resume();return;}
@@ -9,6 +9,13 @@ export class AudioEngine {
     if(!C)throw new Error('Web Audio is not supported on this browser.');
     this.ctx=new C();
     this.master=this.ctx.createGain(); this.master.gain.value=.72; this.master.connect(this.ctx.destination);
+    document.addEventListener('visibilitychange',this._boundResume,{passive:true});
+    window.addEventListener('pageshow',this._boundResume,{passive:true});
+    window.addEventListener('focus',this._boundResume,{passive:true});
+  }
+
+  _resumeIfNeeded(){
+    if(this.ctx?.state==='suspended') this.ctx.resume().catch(()=>{});
   }
 
   stereoTest(){
@@ -40,100 +47,68 @@ export class AudioEngine {
 
   ballApproach(side,duration=1000){
     if(!this.ctx) throw new Error('Audio not initialized');
-
-    // Exactly one approach voice may exist at a time.
-    // A duplicate call while a voice is already playing is ignored so an
-    // accidental second event can never switch the ball from one ear to the other.
+    this._resumeIfNeeded();
     if(this.current?.active) return duration;
 
-    const t=this.ctx.currentTime;
     const sec=Math.max(0.05,duration/1000);
+    const t=this.ctx.currentTime;
     const voice=++this.activeVoice;
     const isLeft=side==='left';
 
-    // One mono approach source is deliberately hard-routed into exactly one
-    // stereo output channel. There is no pan interpolation and therefore no
-    // possibility of the approach itself moving from left to right.
-    const merger=this.ctx.createChannelMerger(2);
-    const leftBus=this.ctx.createGain();
-    const rightBus=this.ctx.createGain();
-    leftBus.gain.setValueAtTime(isLeft?1:0,t);
-    rightBus.gain.setValueAtTime(isLeft?0:1,t);
-    leftBus.connect(merger,0,0);
-    rightBus.connect(merger,0,1);
-    merger.connect(this.master);
+    // One immutable stereo buffer for the entire approach.
+    // The requested ear contains the complete signal; the opposite ear is zero.
+    // No live panning, oscillator, filter, gain envelope, or second source exists.
+    const frames=Math.ceil(this.ctx.sampleRate*sec)+32;
+    const buffer=this.ctx.createBuffer(2,frames,this.ctx.sampleRate);
+    const L=buffer.getChannelData(0);
+    const R=buffer.getChannelData(1);
 
-    const g=this.ctx.createGain();
-    const filter=this.ctx.createBiquadFilter();
-    const osc=this.ctx.createOscillator();
-    filter.type='bandpass';
-    filter.frequency.setValueAtTime(1500,t);
-    filter.Q.setValueAtTime(.75,t);
-
-    // Exact 1-second approach envelope.
-    g.gain.setValueAtTime(.0001,t);
-    g.gain.exponentialRampToValueAtTime(.035,t+Math.min(.18,sec*.10));
-    g.gain.exponentialRampToValueAtTime(.18,t+sec*.72);
-    g.gain.exponentialRampToValueAtTime(.8,t+sec);
-
-    // The pitch rises as the ball gets closer, giving distance/proximity information.
-    osc.type='sawtooth';
-    osc.frequency.setValueAtTime(95,t);
-    osc.frequency.exponentialRampToValueAtTime(340,t+sec);
-    osc.detune.setValueAtTime(isLeft?-4:4,t);
-
-    const noise=this.ctx.createBufferSource();
-    const buf=this.ctx.createBuffer(
-      1,
-      Math.max(1,Math.floor(this.ctx.sampleRate*sec)),
-      this.ctx.sampleRate
-    );
-    const data=buf.getChannelData(0);
-    for(let i=0;i<data.length;i++){
-      const fade=1-(i/data.length);
-      data[i]=(Math.random()*2-1)*Math.pow(Math.max(0,fade),1.4);
-    }
-    noise.buffer=buf;
-
-    const ng=this.ctx.createGain();
-    ng.gain.setValueAtTime(.0001,t);
-    ng.gain.exponentialRampToValueAtTime(.05,t+sec*.65);
-    ng.gain.exponentialRampToValueAtTime(.52,t+sec);
-
-    noise.connect(ng).connect(filter);
-    osc.connect(filter).connect(g);
-    g.connect(isLeft?leftBus:rightBus);
-
-    let active=true;
-    const stop=()=>{
-      if(!active) return;
-      active=false;
-      if(this.current?.voice===voice) this.current=null;
-
-      const now=this.ctx.currentTime;
-
-      // HARD MUTE THE ROUTE FIRST. This prevents any stale audio from being
-      // heard from the old ear while the AudioBuffer/Oscillator nodes stop.
-      try{leftBus.gain.cancelScheduledValues(now);leftBus.gain.setValueAtTime(0,now);}catch{}
-      try{rightBus.gain.cancelScheduledValues(now);rightBus.gain.setValueAtTime(0,now);}catch{}
-      try{g.gain.cancelScheduledValues(now);g.gain.setValueAtTime(.0001,now);}catch{}
-
-      try{noise.stop(now+.005);}catch{}
-      try{osc.stop(now+.005);}catch{}
+    let seed=(voice*1664525+1013904223)>>>0;
+    const rnd=()=>{
+      seed=(1664525*seed+1013904223)>>>0;
+      return (seed/4294967296)*2-1;
     };
 
-    noise.start(t);
-    osc.start(t);
-    osc.stop(t+sec+.02);
+    for(let i=0;i<frames;i++){
+      const p=Math.min(1,i/(frames-1));
+      const envIn=Math.min(1,p/0.08);
+      const envOut=Math.min(1,(1-p)/0.055);
+      const env=envIn*envOut;
 
-    this.current={voice,active:true,stop};
+      // Airy tennis-ball approach: filtered-ish noise approximation + rising body tone.
+      const white=rnd();
+      const air=rnd()*0.55 + white*0.45;
+      const freq=92 + 250*Math.pow(p,1.65);
+      const phase=2*Math.PI*freq*(i/this.ctx.sampleRate);
+      const tonal=(Math.sin(phase)*0.42 + Math.sin(phase*1.97)*0.13);
 
-    // Release ownership at the natural end. No later callback may resurrect it.
-    setTimeout(()=>{
-      if(this.current?.voice!==voice) return;
-      stop();
-    },Math.ceil(sec*1000)+80);
+      // Progressive intensity: quiet at distance, clearly louder at impact.
+      const intensity=0.018 + 0.78*Math.pow(p,1.55);
+      const sample=(air*0.13 + tonal*0.16)*intensity*env;
 
+      if(isLeft) L[i]=sample;
+      else R[i]=sample;
+    }
+
+    const src=this.ctx.createBufferSource();
+    src.buffer=buffer;
+    src.connect(this.master);
+
+    let active=true;
+    const finish=()=>{
+      if(!active)return;
+      active=false;
+      if(this.current?.voice===voice)this.current=null;
+    };
+
+    src.onended=finish;
+    this.current={voice,active:true,stop:()=>{
+      if(!active)return;
+      try{src.stop();}catch{}
+      finish();
+    }};
+
+    src.start(t);
     return duration;
   }
 
