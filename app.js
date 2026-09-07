@@ -80,60 +80,24 @@ function beginPoint(sideOverride=null, remoteStart=false){
   const delay=remoteStart ? 120 : 900+Math.random()*900;
   if(!remoteStart && conn?.open)conn.send({type:'rally',side});
   ballTimer=setTimeout(()=>{
-    audio.ballApproach(side,1000);$('audioState').textContent='BALL APPROACHING';
-    $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:1000,easing:'cubic-bezier(.2,.8,.1,1)'});
-    hitWindow=setTimeout(()=>resolvePoint(null,false,side),1360);
-    beginPoint.side=side;beginPoint.impactAt=performance.now()+1000;
+    audio.ballApproach(side,1900);$('audioState').textContent='BALL APPROACHING';
+    $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:1900,easing:'cubic-bezier(.2,.8,.1,1)'});
+    hitWindow=setTimeout(()=>resolvePoint(null,false,side),2260);
+    beginPoint.side=side;beginPoint.impactAt=performance.now()+1900;
   },delay);
 }
 function handleSwing(){
-  const ev=motion.consumeSwing();
-  if(!ev)return;
-
-  const side=beginPoint.side;
-  if(!side)return;
-
+  const ev=motion.consumeSwing();if(!ev)return;
+  const side=beginPoint.side;if(!side)return;
   const faceDot=Number.isFinite(ev.faceDot)?ev.faceDot:0;
-  const now=performance.now();
-  const impactAt=beginPoint.impactAt||now;
-  const dt=Math.abs((ev.t||now)-impactAt);
-
-  // The SENSOR ENGINE gives us the actual face orientation at the stroke.
-  // Right ball -> phone screen faces the calibrated forward direction.
-  // Left ball  -> phone back panel faces the calibrated forward direction.
-  // The dead zone is intentionally narrow: an edge-on phone must not count.
-  const requiredFace=side==='right' ? 1 : -1;
-  const faceDotThreshold=0.20;
-  const correctFace=requiredFace===1
-    ? faceDot>=faceDotThreshold
-    : faceDot<=-faceDotThreshold;
-
-  // The ball is audible over a broad impact window. We use the swing peak's
-  // actual timestamp instead of requiring one exact callback millisecond.
-  const timingWindowMs=800;
-  const timingScore=clampNumber(1-(dt/timingWindowMs),0,1);
-
-  const valid=correctFace && timingScore>0.04;
-
-  if(valid){
-    audio.hit(side,ev.quality);
-    $('audioState').textContent=side==='right'?'FOREHAND HIT':'BACKHAND HIT';
-    resolvePoint(localPlayer,false,side,true);
-    return;
-  }
-
-  audio.miss();
-  if(!correctFace){
-    $('audioState').textContent=side==='left'
-      ? `MISS — BACKHAND REQUIRED (face ${faceDot.toFixed(2)})`
-      : `MISS — FOREHAND REQUIRED (face ${faceDot.toFixed(2)})`;
-  }else{
-    $('audioState').textContent='MISS — TOO EARLY / LATE';
-  }
-  setTimeout(()=>beginPoint(),800);
+  // Do not rely on a string state transition at the exact impact instant.
+  // Judge the actual phone-face vector: +Z = screen-forward, -Z = back-forward.
+  const correctFace=side==='right' ? faceDot>0.30 : faceDot<-0.30;
+  const now=performance.now();const dt=Math.abs((ev.t||now)-(beginPoint.impactAt||now));const timing=Math.max(0,1-dt/550);
+  const valid=correctFace && timing>0.10;
+  if(valid){audio.hit(side,ev.quality);resolvePoint(localPlayer,false,side,true);}
+  else {audio.miss();$('audioState').textContent=correctFace?'MISS — TOO EARLY / LATE':`MISS — WRONG SIDE (${ev.face||'EDGE'} ${faceDot.toFixed(2)})`;setTimeout(()=>beginPoint(),800);}
 }
-
-function clampNumber(v,a,b){return Math.max(a,Math.min(b,v));}
 function resolvePoint(winner,remote=false,side=null,hit=false){
   clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();
   if(winner===null){audio.miss();$('audioState').textContent='MISS';setTimeout(beginPoint,850);return;}
