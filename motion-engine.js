@@ -2,11 +2,9 @@ const RAD = Math.PI / 180;
 const EPS = 1e-9;
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
-const length = v => Math.hypot(v.x, v.y, v.z);
-const normalize = v => {
-  const n = length(v);
-  return n > EPS ? {x:v.x/n,y:v.y/n,z:v.z/n} : {x:0,y:0,z:0};
-};
+const dot = (a,b) => a.x*b.x + a.y*b.y + a.z*b.z;
+const length = v => Math.hypot(v.x,v.y,v.z);
+const normalize = v => { const n=length(v)||1; return {x:v.x/n,y:v.y/n,z:v.z/n}; };
 const sub = (a,b) => ({x:a.x-b.x,y:a.y-b.y,z:a.z-b.z});
 
 function qNormalize(q){
@@ -32,41 +30,36 @@ function qFromAxisAngle(ax,ay,az,angle){
   return qNormalize({x:ax*s,y:ay*s,z:az*s,w:c});
 }
 
-// DeviceOrientation's alpha/beta/gamma angles are intrinsic rotations.
-// This follows the well-tested DeviceOrientationControls ordering used by
-// three.js: YXZ + device-to-screen correction + screen orientation correction.
+// DeviceOrientation -> device-to-world quaternion.
+// This follows the Y-X-Z convention used by mature browser motion-control
+// implementations, then applies the device and screen orientation corrections.
 function qFromDeviceOrientation(alphaDeg,betaDeg,gammaDeg,screenAngleDeg){
-  const x=(betaDeg||0)*RAD;
-  const y=(alphaDeg||0)*RAD;
-  const z=-(gammaDeg||0)*RAD;
+  const alpha=(alphaDeg||0)*RAD;
+  const beta =(betaDeg||0)*RAD;
+  const gamma=(gammaDeg||0)*RAD;
 
-  // Quaternion for Euler order YXZ.
-  const cy=Math.cos(y/2), sy=Math.sin(y/2);
-  const cx=Math.cos(x/2), sx=Math.sin(x/2);
-  const cz=Math.cos(z/2), sz=Math.sin(z/2);
+  const ca=Math.cos(alpha/2), sa=Math.sin(alpha/2);
+  const cb=Math.cos(beta/2),  sb=Math.sin(beta/2);
+  const cg=Math.cos(gamma/2), sg=Math.sin(gamma/2);
+
+  // Euler order YXZ.
   let q={
-    w:cy*cx*cz + sy*sx*sz,
-    x:cy*sx*cz + sy*cx*sz,
-    y:sy*cx*cz - cy*sx*sz,
-    z:cy*cx*sz - sy*sx*cz
+    w:ca*cb*cg + sa*sb*sg,
+    x:ca*sb*cg + sa*cb*sg,
+    y:sa*cb*cg - ca*sb*sg,
+    z:ca*cb*sg - sa*sb*cg
   };
 
-  // Match the phone/device coordinate convention used by the browser.
+  // Device camera/sensor convention correction.
   q=qMul(q,qFromAxisAngle(1,0,0,-Math.PI/2));
-  q=qMul(q,qFromAxisAngle(0,0,1,-(screenAngleDeg||0)*RAD));
+
+  // CSS screen orientation correction.
+  const screen=(Number(screenAngleDeg)||0)*RAD;
+  q=qMul(q,qFromAxisAngle(0,0,1,-screen));
   return qNormalize(q);
 }
 
-function qFromAngularVelocity(alphaDeg,betaDeg,gammaDeg,dt){
-  // DeviceMotion rotationRate axes: alpha=Z, beta=X, gamma=Y.
-  const wx=(betaDeg||0)*RAD*dt;
-  const wy=(gammaDeg||0)*RAD*dt;
-  const wz=(alphaDeg||0)*RAD*dt;
-  const angle=Math.hypot(wx,wy,wz);
-  if(angle<EPS)return {x:0,y:0,z:0,w:1};
-  const s=Math.sin(angle/2)/angle;
-  return qNormalize({x:wx*s,y:wy*s,z:wz*s,w:Math.cos(angle/2)});
-}
+function finite3(v){return v && Number.isFinite(v.x)&&Number.isFinite(v.y)&&Number.isFinite(v.z);}
 
 export class MotionEngine{
   constructor(){
@@ -80,17 +73,18 @@ export class MotionEngine{
 
     this.currentQ=null;
     this.referenceQ=null;
-    this.gyroQ={x:0,y:0,z:0,w:1};
-    this.lastGyroT=0;
-    this.gyroSamples=0;
+    this.referenceForwardWorld=null;
+    this.referenceRightWorld=null;
+    this.referenceUpWorld=null;
     this.lastOrientationQ=null;
     this.lastOrientationT=0;
     this.lastMotionT=0;
     this.lastSwingT=-Infinity;
     this.lastEmitT=0;
     this.screenAngle=0;
-    this.referenceScreenAngle=0;
     this.running=false;
+    this.orientationSource='none';
+    this.seenAbsoluteOrientation=false;
 
     this.gravityEstimate={x:0,y:0,z:0};
     this.filteredForward=0;
@@ -98,20 +92,21 @@ export class MotionEngine{
     this.prevForward=0;
     this.prev2Forward=0;
     this.prevT=0;
-    this.prev2T=0;
+    this.prevFaceDot=1;
     this.motionBuffer=[];
     this.peakCandidate=null;
 
-    // The detector works on a short physical stroke, not one magic sample.
-    this.triggerAccel=2.8;
-    this.strongAccel=4.8;
-    this.peakDrop=0.65;
-    this.maxPeakAgeMs=190;
-    this.minCooldownMs=300;
+    // Physical stroke detector. These are deliberately modest because mobile
+    // browsers often report different sensor ranges/sample rates.
+    this.triggerAccel=1.75;
+    this.strongAccel=3.25;
+    this.peakDrop=0.30;
+    this.maxPeakAgeMs=180;
+    this.minCooldownMs=320;
   }
 
   on(fn){this.listeners.add(fn);return ()=>this.listeners.delete(fn);}
-  emit(){for(const fn of this.listeners) fn(this.state);}
+  emit(){for(const fn of this.listeners)fn(this.state);}
 
   static supports(){
     return typeof window!=='undefined' &&
@@ -124,7 +119,7 @@ export class MotionEngine{
     if(typeof DeviceOrientationEvent!=='undefined' && typeof DeviceOrientationEvent.requestPermission==='function') requests.push(DeviceOrientationEvent.requestPermission());
     if(requests.length){
       const results=await Promise.all(requests);
-      if(results.some(v=>v!=='granted')) throw new Error('Motion/orientation permission was denied.');
+      if(results.some(v=>v!=='granted'))throw new Error('Motion/orientation permission was denied.');
     }
     await this.start();
   }
@@ -134,8 +129,8 @@ export class MotionEngine{
     this.running=true;
     this.updateScreenAngle();
     window.addEventListener('orientationchange',this.updateScreenAngle,{passive:true});
+    window.addEventListener('deviceorientationabsolute',this.onOrientationAbsolute,{passive:true});
     window.addEventListener('deviceorientation',this.onOrientation,{passive:true});
-    window.addEventListener('deviceorientationabsolute',this.onOrientation,{passive:true});
     window.addEventListener('devicemotion',this.onMotion,{passive:true});
     this.state.ready=true;
     this.emit();
@@ -144,8 +139,8 @@ export class MotionEngine{
   stop(){
     this.running=false;
     window.removeEventListener('orientationchange',this.updateScreenAngle);
+    window.removeEventListener('deviceorientationabsolute',this.onOrientationAbsolute);
     window.removeEventListener('deviceorientation',this.onOrientation);
-    window.removeEventListener('deviceorientationabsolute',this.onOrientation);
     window.removeEventListener('devicemotion',this.onMotion);
   }
 
@@ -153,81 +148,86 @@ export class MotionEngine{
     this.screenAngle=Number(window.screen?.orientation?.angle ?? window.orientation ?? 0)||0;
   };
 
+  onOrientationAbsolute=(e)=>{
+    const ok=this.applyOrientation(e,true);
+    if(ok)this.seenAbsoluteOrientation=true;
+  };
+
   onOrientation=(e)=>{
+    // Once an absolute stream is available, prefer it and ignore the parallel
+    // non-absolute callback so the pose does not jump between coordinate frames.
+    if(this.seenAbsoluteOrientation && this.orientationSource==='absolute')return;
+    this.applyOrientation(e,false);
+  };
+
+  applyOrientation(e,isAbsolute){
     const a=Number(e.alpha),b=Number(e.beta),g=Number(e.gamma);
-    if(!Number.isFinite(a)||!Number.isFinite(b)||!Number.isFinite(g))return;
+    if(![a,b,g].every(Number.isFinite))return false;
+    if(isAbsolute){
+      this.orientationSource='absolute';
+    }else if(this.orientationSource==='none'){
+      this.orientationSource='relative';
+    }else if(this.orientationSource==='absolute'){
+      return false;
+    }
+
     this.updateScreenAngle();
     const q=qFromDeviceOrientation(a,b,g,this.screenAngle);
     const now=performance.now();
+
     if(this.lastOrientationQ){
       const dt=Math.max(0.005,(now-this.lastOrientationT)/1000);
       const dq=qMul(qInverse(this.lastOrientationQ),q);
-      const angle=2*Math.acos(clamp(Math.abs(dq.w),0,1));
-      this.state.rotRate=angle/dt;
+      const w=clamp(Math.abs(dq.w),0,1);
+      this.state.rotRate=(2*Math.acos(w))/dt;
     }
     this.currentQ=q;
     this.lastOrientationQ=q;
     this.lastOrientationT=now;
-    this.state.orientation={alpha:a,beta:b,gamma:g,absolute:Boolean(e.absolute)};
+    this.state.orientation={alpha:a,beta:b,gamma:g,absolute:Boolean(isAbsolute||e.absolute)};
     this.updateRelativeOrientation();
     this.emit();
-  };
+    return true;
+  }
 
   updateRelativeOrientation(){
-    if(!this.referenceQ||!this.currentQ)return;
+    if(!this.referenceForwardWorld||!this.currentQ)return;
 
-    /*
-     * IMPORTANT:
-     * Use the latest DeviceOrientation pose as the authoritative phone pose.
-     *
-     * The previous implementation switched to an integrated gyro quaternion
-     * after only a few samples. Small sensor bias then accumulated into a
-     * significant angular drift. A backhand flip could therefore be reported
-     * inconsistently, especially after several swings.
-     *
-     * The phone's current pose is always compared to the pose captured during
-     * calibration. This gives us a stable "racket face" measurement:
-     *
-     *   +1  = screen facing the calibrated forward direction
-     *    0  = edge-on
-     *   -1  = back panel facing the calibrated forward direction
-     */
-    const poseQ=qMul(qInverse(this.referenceQ),this.currentQ);
-    const screenNormal=qRotate(poseQ,{x:0,y:0,z:1});
-    const d=clamp(screenNormal.z,-1,1);
+    // This is the critical controller calculation:
+    // compare the CURRENT phone screen normal in world space with the
+    // CALIBRATED racket-forward direction. No gyro integration is used here.
+    // Therefore a 180° wrist flip remains a 180° face flip instead of drifting.
+    const screenNormalWorld=qRotate(this.currentQ,{x:0,y:0,z:1});
+    const d=clamp(dot(screenNormalWorld,this.referenceForwardWorld),-1,1);
     this.state.faceDot=d;
 
-    // Hysteresis prevents noisy intermediate orientations from rapidly
-    // toggling screen/back while the wrist is moving through the edge.
+    // Hysteresis prevents noisy sensor readings around the edge from rapidly
+    // toggling screen/back/screen while the player is swinging.
     if(this.state.face==='screen'){
-      if(d<-0.30)this.state.face='back';
-      else if(d<0.20)this.state.face='edge';
+      if(d<-0.55)this.state.face='back';
+      else if(d<0.18)this.state.face='edge';
     }else if(this.state.face==='back'){
-      if(d>0.30)this.state.face='screen';
-      else if(d>-0.20)this.state.face='edge';
+      if(d>0.55)this.state.face='screen';
+      else if(d>-0.18)this.state.face='edge';
     }else{
-      if(d>=0.40)this.state.face='screen';
-      else if(d<=-0.40)this.state.face='back';
+      if(d>=0.38)this.state.face='screen';
+      else if(d<=-0.38)this.state.face='back';
       else this.state.face='edge';
     }
-
     this.state.confidence=Math.round(Math.abs(d)*100);
   }
 
   getLinearAcceleration(e,dt){
     const direct=e.acceleration;
     if(direct&&[direct.x,direct.y,direct.z].every(Number.isFinite)){
-      const v={x:Number(direct.x),y:Number(direct.y),z:Number(direct.z)};
       this.state.source='linear';
-      return v;
+      return {x:Number(direct.x),y:Number(direct.y),z:Number(direct.z)};
     }
 
     const raw=e.accelerationIncludingGravity;
     if(!raw||![raw.x,raw.y,raw.z].every(Number.isFinite))return null;
     const v={x:Number(raw.x),y:Number(raw.y),z:Number(raw.z)};
-    // Slow gravity estimator: fast enough for posture changes, slow enough not
-    // to eat the short impulse of a tennis stroke.
-    const alpha=clamp(dt/0.65,0.008,0.09);
+    const alpha=clamp(dt/0.70,0.006,0.075);
     this.gravityEstimate={
       x:this.gravityEstimate.x+alpha*(v.x-this.gravityEstimate.x),
       y:this.gravityEstimate.y+alpha*(v.y-this.gravityEstimate.y),
@@ -238,7 +238,7 @@ export class MotionEngine{
   }
 
   onMotion=(e)=>{
-    if(!this.currentQ||!this.referenceQ)return;
+    if(!this.currentQ||!this.referenceQ||!this.referenceForwardWorld)return;
     const now=performance.now();
     const dt=this.lastMotionT?clamp((now-this.lastMotionT)/1000,0.008,0.08):0.016;
     this.lastMotionT=now;
@@ -248,29 +248,20 @@ export class MotionEngine{
     if(any&&[any.x,any.y,any.z].every(Number.isFinite))
       this.state.accel={x:Number(any.x),y:Number(any.y),z:Number(any.z)};
 
-    const rr=e.rotationRate;
-    if(rr && [rr.alpha,rr.beta,rr.gamma].every(Number.isFinite)){
-      const dq=qFromAngularVelocity(rr.alpha,rr.beta,rr.gamma,dt);
-      this.gyroQ=qNormalize(qMul(this.gyroQ,dq));
-      this.gyroSamples++;
-      this.lastGyroT=now;
-    }
-
     const linear=this.getLinearAcceleration(e,dt);
     if(!linear)return;
 
-    /*
-     * Transform acceleration through the same calibrated pose used for the
-     * racket-face calculation. This keeps the thrust axis and face axis in
-     * one coordinate frame instead of mixing two independently drifting
-     * orientation estimates.
-     */
-    const poseQ=qMul(qInverse(this.referenceQ),this.currentQ);
-    const calAccel=qRotate(poseQ,linear);
-    const rawF=calAccel.z;
-    const lateral=Math.hypot(calAccel.x,calAccel.y);
+    // Convert acceleration into the same world frame used for the calibrated
+    // racket. Forward thrust remains positive both for forehand and backhand:
+    // the FACE decides which stroke it is, while the WORLD thrust decides that
+    // the racket actually moved toward the ball.
+    const worldAccel=qRotate(this.currentQ,linear);
+    const rawF=dot(worldAccel,this.referenceForwardWorld);
+    const sideA=dot(worldAccel,this.referenceRightWorld);
+    const sideB=dot(worldAccel,this.referenceUpWorld);
+    const lateral=Math.hypot(sideA,sideB);
 
-    const fa=clamp(dt/0.04,0.10,0.45);
+    const fa=clamp(dt/0.045,0.10,0.40);
     this.filteredForward += fa*(rawF-this.filteredForward);
     this.filteredLateral += fa*(lateral-this.filteredLateral);
     this.state.forwardAccel=this.filteredForward;
@@ -278,20 +269,35 @@ export class MotionEngine{
     this.state.lateralAccel=this.filteredLateral;
     this.updateRelativeOrientation();
 
-    const sample={t:now,f:this.filteredForward,raw:rawF,lat:this.filteredLateral,faceDot:this.state.faceDot,face:this.state.face,rot:this.state.rotRate};
+    const sample={
+      t:now,
+      f:this.filteredForward,
+      raw:rawF,
+      lat:this.filteredLateral,
+      faceDot:this.state.faceDot,
+      face:this.state.face,
+      rot:this.state.rotRate
+    };
     this.motionBuffer.push(sample);
     while(this.motionBuffer.length&&now-this.motionBuffer[0].t>280)this.motionBuffer.shift();
 
-    // Detect a peak. We intentionally timestamp the actual peak sample rather
-    // than the later threshold-crossing callback, which fixes timing drift.
+    // A stroke is detected from the SHAPE of the acceleration burst:
+    // rising -> peak -> falling. It is not tied to one browser sample.
     const prev=this.prevForward;
     const prev2=this.prev2Forward;
     const isRise=prev>prev2;
-    const crossed=prev>=this.triggerAccel || prev>=this.strongAccel;
+    const crossed=prev>=this.triggerAccel;
     const dropped=(prev-this.filteredForward)>=this.peakDrop;
 
     if(isRise&&crossed){
-      this.peakCandidate={t:this.prevT,f:prev,faceDot:this.prevFaceDot,face:this.prevFace,rot:this.prevRot};
+      this.peakCandidate={
+        t:this.prevT,
+        f:prev,
+        lat:this.prevLateral,
+        faceDot:this.prevFaceDot,
+        face:this.prevFace,
+        rot:this.prevRot
+      };
     }
 
     if(this.peakCandidate){
@@ -306,11 +312,11 @@ export class MotionEngine{
 
     this.prev2Forward=prev;
     this.prevForward=this.filteredForward;
-    this.prev2T=this.prevT;
     this.prevT=now;
     this.prevFaceDot=this.state.faceDot;
     this.prevFace=this.state.face;
     this.prevRot=this.state.rotRate;
+    this.prevLateral=this.filteredLateral;
 
     this.emit();
   };
@@ -319,35 +325,38 @@ export class MotionEngine{
     const now=performance.now();
     if(now-this.lastSwingT<this.minCooldownMs)return;
 
-    // Reject obvious sideways bumps. A real stroke must have a substantial
-    // forward component relative to the lateral component.
-    const ratio=Math.max(0,peak.f)/(Math.abs(peak.f)+Math.max(0,peak.lat)+0.001);
-    if(peak.f<this.triggerAccel&&ratio<0.52)return;
+    // Do not demand a huge jerk. A tennis stroke is already characterized by
+    // a clear forward acceleration burst; lateral acceleration is permitted.
+    if(peak.f<this.triggerAccel)return;
 
     this.lastSwingT=peak.t;
     this.state.swing=true;
-    const magnitude=clamp((peak.f-2.0)/7.0,0,1);
+    const magnitude=clamp((peak.f-1.5)/5.5,0,1);
     const faceScore=clamp(Math.abs(peak.faceDot),0,1);
-    const rotScore=clamp((peak.rot||0)/2.0,0,1);
-    this.state.hitQuality=clamp(0.62*magnitude+0.28*faceScore+0.10*rotScore,0,1);
+    const rotScore=clamp((peak.rot||0)/3.5,0,1);
+    this.state.hitQuality=clamp(0.65*magnitude+0.25*faceScore+0.10*rotScore,0,1);
     this.state.faceDot=peak.faceDot;
     this.state.face=peak.face;
+    this.state.forwardAccel=peak.f;
+    this.state.lateralAccel=peak.lat;
     this.emit();
+
     setTimeout(()=>{
       if(performance.now()-this.lastSwingT>90){
         this.state.swing=false;
         this.emit();
       }
-    },100);
+    },110);
   }
 
   calibrate(){
     if(!this.currentQ)throw new Error('No orientation sample yet. Hold the phone still and try again.');
+
     this.referenceQ=qNormalize({...this.currentQ});
-    this.gyroQ={x:0,y:0,z:0,w:1};
-    this.gyroSamples=0;
-    this.lastGyroT=performance.now();
-    this.referenceScreenAngle=this.screenAngle;
+    this.referenceForwardWorld=normalize(qRotate(this.referenceQ,{x:0,y:0,z:1}));
+    this.referenceRightWorld=normalize(qRotate(this.referenceQ,{x:1,y:0,z:0}));
+    this.referenceUpWorld=normalize(qRotate(this.referenceQ,{x:0,y:1,z:0}));
+
     this.state.calibrated=true;
     this.state.face='screen';
     this.state.faceDot=1;
@@ -360,6 +369,7 @@ export class MotionEngine{
     this.prevFaceDot=1;
     this.prevFace='screen';
     this.prevRot=0;
+    this.prevLateral=0;
     this.peakCandidate=null;
     this.motionBuffer=[];
     this.gravityEstimate={x:0,y:0,z:0};
@@ -374,6 +384,7 @@ export class MotionEngine{
       face:this.state.face,
       faceDot:this.state.faceDot,
       forwardAccel:this.state.forwardAccel,
+      lateralAccel:this.state.lateralAccel,
       quality:this.state.hitQuality,
       rotRate:this.state.rotRate,
       t:this.lastSwingT
