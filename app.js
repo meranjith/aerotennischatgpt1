@@ -7,7 +7,7 @@ const motion=new MotionEngine();
 const audio=new AudioEngine();
 const match=new TennisMatch();
 let wakeLock=null, mode='lobby', localPlayer=0, peer=null, conn=null, roomCode='', ballTimer=null, hitWindow=null;
-let incomingSide=null, incomingDuration=1000, impactAt=0, rallyToken=0;
+let incomingSide=null, incomingDuration=1000, impactAt=0, rallyId=0, rallyInProgress=false;
 
 function show(id){for(const el of document.querySelectorAll('.screen'))el.classList.remove('active');$(id).classList.add('active');}
 function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>el.classList.remove('show'),2400);}
@@ -57,9 +57,9 @@ function wireConnection(){
   conn.on('open',()=>{mode='game';show('screenGame');$('modeLabel').textContent='LIVE MATCH';$('serveLabel').textContent='PLAYER 1 TO SERVE';toast('Peer connection established.');if(localPlayer===1 && conn.open)conn.send({type:'ready'});if(localPlayer===0)beginPoint();});
   conn.on('data',msg=>{
     if(msg?.type==='point'){resolvePoint(msg.winner,true);return;}
-    if(msg?.type==='rally'){startRemoteBall(msg.side,msg.duration||1000,msg.token);return;}
+    if(msg?.type==='rally'){startRemoteBall(msg.side,1000,msg.id);return;}
+    if(msg?.type==='shot'){startRemoteBall(msg.side,msg.duration,msg.id);return;}
     if(msg?.type==='ready'){if(localPlayer===0)beginPoint();}
-    if(msg?.type==='shot'){startRemoteBall(msg.side,msg.duration||1000,msg.token);return;}
   });
 }
 function createRoom(){
@@ -73,89 +73,115 @@ async function startGame(newMode,player){
   mode='game';localPlayer=player;show('screenGame');$('modeLabel').textContent=newMode==='practice'?'WALL MODE':'LIVE MATCH';$('p1Name').textContent='P1';$('p2Name').textContent=newMode==='practice'?'WALL':'P2';updateScore();await speak(`Ready. ${localPlayer===0?'Player 1':'Player 2'} to serve.`);beginPoint();}
 function updateScore(){ $('p1Score').textContent=match.pointLabel().split(' - ')[0].replace('LOVE','0').replace('15','15').replace('30','30').replace('40','40').replace('DEUCE','40').replace('ADVANTAGE P1','40'); $('p2Score').textContent=match.pointLabel().split(' - ')[1]?.replace('LOVE','0').replace('15','15').replace('30','30').replace('40','40').replace('ADVANTAGE P2','40')||'40'; }
 async function speak(t){ if(!('speechSynthesis' in window))return; speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=.88;u.pitch=.78;speechSynthesis.speak(u); }
-const NORMAL_DURATION=1000;
-const FAST_DURATION=500;
-const FAST_SWING_THRESHOLD=0.58;
-
-function swingSpeedScore(ev){
-  const accel=Number(ev?.forwardAccel)||0;
-  const rot=Math.abs(Number(ev?.rotRate)||0);
-  const accelScore=clampNumber((Math.max(0,accel)-1.5)/8.5,0,1);
-  const rotationScore=clampNumber(rot/4.5,0,1);
-  return clampNumber(0.72*accelScore+0.28*rotationScore,0,1);
-}
-
-function durationFromSpeed(score){
-  return Number(score)>=FAST_SWING_THRESHOLD ? FAST_DURATION : NORMAL_DURATION;
-}
-
 function beginPoint(sideOverride=null, remoteStart=false){
   clearTimeout(ballTimer); clearTimeout(hitWindow); audio.stopApproach();
   $('audioState').textContent='LISTEN'; $('directionState').textContent='—';
   if(mode!=='game')return;
 
-  // PRACTICE PATH IS KEPT IDENTICAL TO THE KNOWN-GOOD BUILD.
-  const side=sideOverride || (Math.random()<.5?'left':'right');
-  $('directionState').textContent=side.toUpperCase();
+  // KEEP THIS PRACTICE/TRAINING PATH UNCHANGED:
+  // random side, 1-second approach, local hit detection.
+  const side=sideOverride || (Math.random()<.5?'left':'right');$('directionState').textContent=side.toUpperCase();
   const delay=remoteStart ? 120 : 900+Math.random()*900;
 
-  if(!remoteStart && conn?.open) conn.send({type:'rally',side,duration:NORMAL_DURATION,token:++rallyToken});
+  // Only an actual multiplayer host sends the initial ball.
+  if(!remoteStart && conn?.open) conn.send({type:'rally',side,id:++rallyId});
 
   ballTimer=setTimeout(()=>{
     incomingSide=side;
-    incomingDuration=NORMAL_DURATION;
-    impactAt=performance.now()+NORMAL_DURATION;
-    audio.ballApproach(side,NORMAL_DURATION);
+    incomingDuration=1000;
+    impactAt=performance.now()+1000;
+    rallyInProgress=Boolean(conn?.open);
+    audio.ballApproach(side,1000);
     $('audioState').textContent='BALL APPROACHING';
-    $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:NORMAL_DURATION,easing:'cubic-bezier(.2,.8,.1,1)'});
+    $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:1000,easing:'cubic-bezier(.2,.8,.1,1)'});
     hitWindow=setTimeout(()=>resolvePoint(null,false,side),1360);
+    beginPoint.side=side;
+    beginPoint.impactAt=impactAt;
   },delay);
 }
 
-function startRemoteBall(side,duration,token){
-  if(mode!=='game')return;
-  clearTimeout(ballTimer); clearTimeout(hitWindow); audio.stopApproach();
+function startRemoteBall(side,duration,id){
+  if(mode!=='game' || !conn?.open)return;
+
+  clearTimeout(ballTimer);
+  clearTimeout(hitWindow);
+  audio.stopApproach();
+
   const cleanSide=side==='left'?'left':'right';
+  const cleanDuration=Number(duration)===500 ? 500 : 1000;
+
   incomingSide=cleanSide;
-  incomingDuration=Number(duration)===FAST_DURATION?FAST_DURATION:NORMAL_DURATION;
-  if(token!=null)rallyToken=token;
-  impactAt=performance.now()+incomingDuration;
-  $('directionState').textContent=cleanSide.toUpperCase();
+  incomingDuration=cleanDuration;
+  impactAt=performance.now()+cleanDuration;
+  rallyInProgress=true;
+  rallyId=id ?? rallyId;
+  beginPoint.side=cleanSide;
+  beginPoint.impactAt=impactAt;
+
   $('audioState').textContent='BALL APPROACHING';
-  audio.ballApproach(cleanSide,incomingDuration);
-  $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:incomingDuration,easing:'cubic-bezier(.2,.8,.1,1)'});
-  hitWindow=setTimeout(()=>resolvePoint(null,false,cleanSide),incomingDuration+360);
+  $('directionState').textContent=cleanSide.toUpperCase();
+  audio.ballApproach(cleanSide,cleanDuration);
+  $('pulse').animate([
+    {transform:'scale(.55)',opacity:.12},
+    {transform:'scale(1.05)',opacity:.5}
+  ],{
+    duration:cleanDuration,
+    easing:'cubic-bezier(.2,.8,.1,1)'
+  });
+
+  // Give the receiver a small grace period after the impact time before
+  // declaring a miss; this is independent of shot speed and does not alter
+  // the required 500/1000 ms approach duration.
+  hitWindow=setTimeout(
+    ()=>resolvePoint(null,false,cleanSide),
+    cleanDuration+360
+  );
+}
+
+function isFastSwing(ev){
+  // IMPORTANT: this is a classification only. The actual swing detector and
+  // face/side mechanics remain in motion-engine.js and are not modified.
+  const forward=Math.max(0,Number(ev?.forwardAccel)||0);
+  return forward>=5.5;
 }
 
 function handleSwing(){
   const ev=motion.consumeSwing();
   if(!ev)return;
 
-  const side=incomingSide;
+  // Keep using the exact working swing discrimination.
+  const side=beginPoint.side;
   if(!side)return;
 
   const faceDot=Number.isFinite(ev.faceDot)?ev.faceDot:0;
   const now=performance.now();
-  const dt=Math.abs((ev.t||now)-impactAt);
+  const pointImpactAt=beginPoint.impactAt||now;
+  const dt=Math.abs((ev.t||now)-pointImpactAt);
 
-  // UNCHANGED swing discrimination.
   const requiredFace=side==='right' ? 1 : -1;
   const faceDotThreshold=0.20;
-  const correctFace=requiredFace===1 ? faceDot>=faceDotThreshold : faceDot<=-faceDotThreshold;
+  const correctFace=requiredFace===1
+    ? faceDot>=faceDotThreshold
+    : faceDot<=-faceDotThreshold;
+
   const timingWindowMs=800;
   const timingScore=clampNumber(1-(dt/timingWindowMs),0,1);
   const valid=correctFace && timingScore>0.04;
 
   if(!valid){
     audio.miss();
-    $('audioState').textContent=!correctFace
-      ? (side==='left'?`MISS — BACKHAND REQUIRED (face ${faceDot.toFixed(2)})`:`MISS — FOREHAND REQUIRED (face ${faceDot.toFixed(2)})`)
-      : 'MISS — TOO EARLY / LATE';
+    if(!correctFace){
+      $('audioState').textContent=side==='left'
+        ? `MISS — BACKHAND REQUIRED (face ${faceDot.toFixed(2)})`
+        : `MISS — FOREHAND REQUIRED (face ${faceDot.toFixed(2)})`;
+    }else{
+      $('audioState').textContent='MISS — TOO EARLY / LATE';
+    }
     setTimeout(()=>beginPoint(),800);
     return;
   }
 
-  // PRACTICE MODE: EXACTLY THE OLD BEHAVIOR. Speed is NOT injected here.
+  // PRACTICE MODE: preserve the known-good behavior exactly.
   if(!conn?.open){
     audio.hit(side,ev.quality);
     $('audioState').textContent=side==='right'?'FOREHAND HIT':'BACKHAND HIT';
@@ -163,24 +189,38 @@ function handleSwing(){
     return;
   }
 
-  // LIVE MULTIPLAYER: the outgoing shot gets exactly NORMAL (1.0 s) or FAST (0.5 s).
-  const speed=swingSpeedScore(ev);
-  const nextDuration=durationFromSpeed(speed);
+  // LIVE MULTIPLAYER ONLY:
+  // successful hit transfers the ball instead of ending the point.
+  // Normal = exactly 1000 ms, Fast = exactly 500 ms.
+  const nextDuration=isFastSwing(ev)?500:1000;
   const nextSide=Math.random()<0.5?'left':'right';
-  const token=rallyToken;
+  const nextId=(rallyId||0)+1;
+  rallyId=nextId;
 
   audio.hit(side,ev.quality);
-  $('audioState').textContent=`${side==='right'?'FOREHAND':'BACKHAND'} HIT · ${nextDuration===FAST_DURATION?'FAST':'NORMAL'}`;
+  $('audioState').textContent=
+    `${side==='right'?'FOREHAND':'BACKHAND'} HIT · ${nextDuration===500?'FAST':'NORMAL'}`;
 
-  clearTimeout(ballTimer); clearTimeout(hitWindow); audio.stopApproach();
-  incomingSide=null; impactAt=0;
+  clearTimeout(ballTimer);
+  clearTimeout(hitWindow);
+  audio.stopApproach();
+  incomingSide=null;
+  incomingDuration=nextDuration;
+  impactAt=0;
+  rallyInProgress=true;
 
-  conn.send({type:'shot',side:nextSide,duration:nextDuration,token});
+  conn.send({
+    type:'shot',
+    side:nextSide,
+    duration:nextDuration,
+    id:nextId
+  });
 }
 
 function clampNumber(v,a,b){return Math.max(a,Math.min(b,v));}
 function resolvePoint(winner,remote=false,side=null,hit=false){
   clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();
+  incomingSide=null; incomingDuration=1000; impactAt=0; rallyInProgress=false;
   if(winner===null){audio.miss();$('audioState').textContent='MISS';setTimeout(beginPoint,850);return;}
   const result=match.point(winner);updateScore();$('audioState').textContent=hit?'CLEAN HIT':'POINT';$('directionState').textContent=side?side.toUpperCase():'—';
   if(!remote&&conn?.open)conn.send({type:'point',winner});
@@ -190,7 +230,7 @@ function resolvePoint(winner,remote=false,side=null,hit=false){
   } else $('serveLabel').textContent=`${match.pointLabel()} · ${match.server===0?'PLAYER 1':'PLAYER 2'} TO SERVE`;
   setTimeout(()=>{if(mode==='game')beginPoint();},1150);
 }
-function stopGame(){mode='lobby';clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}if(conn){try{conn.close()}catch{}}if(peer){try{peer.destroy()}catch{}}conn=null;peer=null;roomCode='';$('joinBox').classList.add('hidden');$('roomBox').classList.add('hidden');}
+function stopGame(){mode='lobby';clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();incomingSide=null;incomingDuration=1000;impactAt=0;rallyInProgress=false;if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}if(conn){try{conn.close()}catch{}}if(peer){try{peer.destroy()}catch{}}conn=null;peer=null;roomCode='';$('joinBox').classList.add('hidden');$('roomBox').classList.add('hidden');}
 
 // Register PWA service worker only on HTTPS (GitHub Pages is HTTPS).
 if('serviceWorker' in navigator && location.protocol==='https:') navigator.serviceWorker.register('./sw.js').catch(()=>{});
