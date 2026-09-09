@@ -15,7 +15,10 @@ const app={
   peer:null, conn:null, host:false,
   timers:{launch:null,miss:null,nextPoint:null},
   lastResolvedPoint:-1,
-  ready:false
+  ready:false,
+  ballToken:0,
+  returnToken:0,
+  lastSwingAt:0
 };
 
 function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
@@ -49,25 +52,27 @@ $('joinBtn').onclick=()=>{$('joinBox').classList.toggle('hidden');$('roomInput')
 $('confirmJoinBtn').onclick=async()=>{const code=$('roomInput').value.replace(/\D/g,'');if(code.length!==6)return toast('Enter a 6-digit code.');try{if(!motion.state.calibrated){if(!await ensureReady()){show('screenCalibration');app.mode='calibrating';return;}}else await audio.init();startJoin(code);}catch(e){toast(e.message);}};
 
 function setButtons(v){['practiceBtn','createBtn','joinBtn','calibrateBtn'].forEach(id=>$(id).disabled=!v);}
-function clearTimers(){for(const k of Object.keys(app.timers))clearTimeout(app.timers[k]);app.timers={launch:null,miss:null,nextPoint:null};audio.stopApproach();}
+function clearTimers(){for(const k of Object.keys(app.timers))clearTimeout(app.timers[k]);app.timers={launch:null,miss:null,nextPoint:null};app.ballToken++;app.returnToken++;audio.stopApproach();}
 function setGameLabels(){ $('modeLabel').textContent=app.practice?'WALL MODE':'LIVE MATCH';$('p1Name').textContent='P1';$('p2Name').textContent=app.practice?'WALL':'P2';updateScore(); }
 function prepareGame(){
   clearTimers();
-  try{screen.orientation?.lock?.('landscape').catch?.(()=>{});}catch{}match.reset();app.pointId=0;app.shotSeq=0;app.lastResolvedPoint=-1;app.activeBall=false;app.side=null;app.duration=NORMAL_MS;
-  app.mode='game';show('screenGame');setGameLabels();$('serveLabel').textContent='PLAYER 1 TO SERVE';
+  try{screen.orientation?.lock?.('landscape').catch?.(()=>{});}catch{}match.reset();app.pointId=0;app.shotSeq=0;app.lastResolvedPoint=-1;app.activeBall=false;app.side=null;app.duration=NORMAL_MS;app.lastSwingAt=0;app.ballToken=0;app.returnToken=0;
+  app.mode='game';motion.resetForGame();show('screenGame');setGameLabels();$('serveLabel').textContent='PLAYER 1 TO SERVE';
 }
 async function startPractice(){app.practice=true;app.player=0;app.host=false;app.conn=null;app.peer=null;prepareGame();await speak('Wall mode ready.');queuePracticeBall(NORMAL_MS);}
 
 function queuePracticeBall(duration){
   clearTimeout(app.timers.launch);clearTimeout(app.timers.miss);audio.stopApproach();
+  const token=++app.ballToken;
   const side=nextRandomSide();
-  app.timers.launch=setTimeout(()=>startBall(side,duration),620);
+  app.timers.launch=setTimeout(()=>{if(token===app.ballToken)startBall(side,duration);},650);
 }
 
 function startBall(side,duration){
   if(app.mode!=='game')return;
   clearTimeout(app.timers.miss);
   audio.stopApproach();
+  const token=++app.ballToken;
   app.side=side==='left'?'left':'right';
   app.duration=duration===FAST_MS?FAST_MS:NORMAL_MS;
   app.impactAt=performance.now()+app.duration;
@@ -76,30 +81,36 @@ function startBall(side,duration){
   $('directionState').textContent=app.side.toUpperCase();
   audio.ballApproach(app.side,app.duration);
   $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:app.duration,easing:'ease-out'});
-  app.timers.miss=setTimeout(()=>receiverMiss(),app.duration+320);
+  app.timers.miss=setTimeout(()=>{if(token===app.ballToken&&app.activeBall)receiverMiss();},app.duration+380);
 }
 
 function handleSwing(){
   if(!app.activeBall || !app.side)return;
   const swing=motion.consumeSwing();
   if(!swing)return;
+  // A swing can only resolve the current ball once. The wider window compensates
+  // for Bluetooth/audio latency and mobile sensor sampling without allowing a
+  // swing from the previous ball to count.
+  if(swing.t<=app.lastSwingAt)return;
+  app.lastSwingAt=swing.t;
   const faceOK=shotIsValidForSide(app.side,swing.face);
-  const dt=Math.abs(swing.t-app.impactAt);
-  const timingOK=dt<=Math.max(240,app.duration*.45);
+  const dt=swing.t-app.impactAt;
+  const timingOK=dt>=-360 && dt<=420;
   if(!faceOK || !timingOK){
-    app.activeBall=false;clearTimeout(app.timers.miss);audio.stopApproach();audio.miss();
+    app.activeBall=false;app.ballToken++;clearTimeout(app.timers.miss);audio.stopApproach();audio.miss();
     $('audioState').textContent=!faceOK?'MISS — WRONG RACKET FACE':'MISS — TOO EARLY / LATE';
     receiverMiss();
     return;
   }
 
-  app.activeBall=false;clearTimeout(app.timers.miss);audio.stopApproach();audio.hit(app.side,swing.quality);
+  app.activeBall=false;app.ballToken++;clearTimeout(app.timers.miss);audio.stopApproach();audio.hit(app.side,swing.quality);
   const speed=swing.speed==='fast'?'fast':'normal';
   const nextDuration=durationForSpeed(speed);
   $('audioState').textContent=`${app.side==='right'?'FOREHAND':'BACKHAND'} · ${speed.toUpperCase()}`;
 
   if(app.practice){
-    app.timers.nextPoint=setTimeout(()=>queuePracticeReturn(nextDuration),230);
+    const token=++app.returnToken;
+    app.timers.nextPoint=setTimeout(()=>{if(token===app.returnToken)queuePracticeReturn(nextDuration);},650);
   }else{
     const nextSide=nextRandomSide();
     app.shotSeq++;
@@ -107,12 +118,16 @@ function handleSwing(){
   }
 }
 function queuePracticeReturn(duration){
+  if(app.mode!=='game'||!app.practice)return;
   const side=nextRandomSide();
   startBall(side,duration);
 }
 function receiverMiss(){
+  if(!app.activeBall && !app.practice && app.lastResolvedPoint===app.pointId)return;
+  app.activeBall=false;
   if(app.practice){
-    app.timers.nextPoint=setTimeout(()=>queuePracticeBall(NORMAL_MS),700);
+    const token=++app.returnToken;
+    app.timers.nextPoint=setTimeout(()=>{if(token===app.returnToken)queuePracticeBall(NORMAL_MS);},900);
     return;
   }
   const winner=app.player^1;

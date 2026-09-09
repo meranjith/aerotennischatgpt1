@@ -1,23 +1,25 @@
-# AeroTennis v2 — clean motion/audio core
+# AeroTennis — working motion/audio revision
 
-This build is intentionally independent of the previous prototype architecture.
+This revision focuses on the gameplay state machine and sensor math.
 
-## Core rules
+## Fixed
+- Forehand/backhand face detection now compares the phone's calibrated screen normal in world space.
+- Acceleration is transformed into the calibrated frame with the correct quaternion direction.
+- Swing detection uses the acceleration peak and emits exactly one swing event, followed by a longer refractory period.
+- A stale ball timer cannot resolve a newer ball because every ball has a token.
+- A successful hit invalidates its miss timer immediately.
+- Practice returns are deliberately delayed so the next ball does not appear immediately after a receipt.
+- Audio approach playback remains one voice at a time; hit/miss stops the approach before playing the result sound.
+- Hit timing tolerates mobile sensor/audio latency: 360 ms early to 420 ms late.
 
-- Right-side ball = forehand = screen-forward at impact.
-- Left-side ball = backhand = flip phone so back panel is forward at impact.
-- Normal swing = exactly 1000 ms receiver approach.
-- Fast swing = exactly 500 ms receiver approach.
-- Practice mode is local and does not depend on multiplayer state.
-- One approach audio voice can exist at a time.
-- Approach direction is baked into a 2-channel AudioBuffer; the non-target channel is all zeros.
-- No service worker is used, avoiding stale PWA audio code during testing.
+## Use
+1. Serve the site over HTTPS.
+2. Allow motion/orientation permissions.
+3. Run the stereo test with headphones.
+4. Calibrate while holding the phone in the neutral screen-forward racket position.
+5. In Wall Mode, RIGHT means screen side forward; LEFT means back side forward.
 
-## GitHub Pages
+## Verification
+`npm test` passes the deterministic rally/audio timing rules included in `tests.mjs`.
 
-Upload all files to the repository root and enable GitHub Pages from the main branch root.
-Open the resulting HTTPS page on the phone.
-
-## Important limitation
-
-Browser motion/orientation behavior is device-dependent. HTTPS and sensor permission are required. PeerJS provides signaling while WebRTC carries the peer data connection.
+Browser motion sensors are hardware/browser dependent, so the final validation must be done on the target phone.
