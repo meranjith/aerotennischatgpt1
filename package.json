@@ -1,0 +1,6 @@
+{
+  "name":"aerotennis-v2-static",
+  "private":true,
+  "type":"module",
+  "scripts":{"test":"node tests.mjs"}
+}

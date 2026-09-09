@@ -1,152 +1,185 @@
-function clamp(x,a,b){return Math.max(a,Math.min(b,x));}
+// AeroTennis v2 audio engine.
+// One approach = one AudioBufferSourceNode. The buffer itself contains the
+// complete left/right routed waveform, so direction can never jump mid-sound.
+
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+
+function mulberry32(seed){
+  return ()=>{
+    let t=seed+=0x6D2B79F5;
+    t=Math.imul(t^t>>>15,t|1);
+    t^=t+Math.imul(t^t>>>7,t|61);
+    return ((t^t>>>14)>>>0)/4294967296;
+  };
+}
 
 export class AudioEngine {
-  constructor(){this.ctx=null;this.master=null;this.ambient=null;this.current=null;this.activeVoice=0;}
+  constructor(){
+    this.ctx=null;
+    this.master=null;
+    this.currentApproach=null;
+    this.approachSerial=0;
+    this.masterGain=0.78;
+    this.unlocked=false;
+  }
 
   async init(){
-    if(this.ctx){if(this.ctx.state==='suspended') await this.ctx.resume();return;}
-    const C=window.AudioContext||window.webkitAudioContext;
-    if(!C)throw new Error('Web Audio is not supported on this browser.');
-    this.ctx=new C();
-    this.master=this.ctx.createGain(); this.master.gain.value=.72; this.master.connect(this.ctx.destination);
+    if(this.ctx){
+      if(this.ctx.state==='suspended') await this.ctx.resume();
+      return;
+    }
+    const Ctx=window.AudioContext||window.webkitAudioContext;
+    if(!Ctx) throw new Error('Web Audio is not supported on this phone/browser.');
+    this.ctx=new Ctx({latencyHint:'interactive'});
+    this.master=this.ctx.createGain();
+    this.master.gain.value=this.masterGain;
+    this.master.connect(this.ctx.destination);
+    this.unlocked=true;
+
+    const resume=()=>{
+      if(this.ctx?.state==='suspended') this.ctx.resume().catch(()=>{});
+    };
+    document.addEventListener('visibilitychange',resume,{passive:true});
+    window.addEventListener('focus',resume,{passive:true});
+  }
+
+  async resume(){
+    if(!this.ctx) await this.init();
+    if(this.ctx.state==='suspended') await this.ctx.resume();
   }
 
   stereoTest(){
-    if(!this.ctx)throw new Error('Audio not initialized');
-    this._tone(-1,480,0.45,0.28); setTimeout(()=>this._tone(1,760,0.45,0.28),700);
+    if(!this.ctx) throw new Error('Audio not initialized.');
+    const now=this.ctx.currentTime;
+    this._playToneBuffer(-1,now,440,.32);
+    this._playToneBuffer(1,now+.65,660,.32);
   }
 
-  _tone(pan,freq,dur,gain){
-    const t=this.ctx.currentTime;
-    const osc=this.ctx.createOscillator(), g=this.ctx.createGain();
-    const left=this.ctx.createGain(), right=this.ctx.createGain();
-    const merger=this.ctx.createChannelMerger(2);
-
-    // Explicit channel routing: do not depend on browser-specific StereoPanner behavior.
-    left.gain.value=pan<0?1:0;
-    right.gain.value=pan>0?1:0;
-
-    osc.frequency.value=freq;
-    g.gain.setValueAtTime(.0001,t);
-    g.gain.exponentialRampToValueAtTime(gain,t+.02);
-    g.gain.exponentialRampToValueAtTime(.0001,t+dur);
-
-    osc.connect(g);
-    g.connect(left); g.connect(right);
-    left.connect(merger,0,0); right.connect(merger,0,1);
-    merger.connect(this.master);
-    osc.start(t); osc.stop(t+dur+.03);
+  _playToneBuffer(side,start,freq,gain){
+    const n=Math.floor(this.ctx.sampleRate*.34);
+    const buf=this.ctx.createBuffer(2,n,this.ctx.sampleRate);
+    const left=buf.getChannelData(0), right=buf.getChannelData(1);
+    for(let i=0;i<n;i++){
+      const p=i/n;
+      const env=Math.sin(Math.PI*p)**1.5;
+      const s=Math.sin(2*Math.PI*freq*i/this.ctx.sampleRate)*gain*env;
+      if(side<0) left[i]=s; else right[i]=s;
+    }
+    const src=this.ctx.createBufferSource();
+    src.buffer=buf; src.connect(this.master); src.start(start);
   }
 
-  ballApproach(side,duration=1000){
-    this.stopApproach();
-    const t=this.ctx.currentTime;
-    const sec=duration/1000;
-    const voice=++this.activeVoice;
+  _createApproachBuffer(side,duration){
+    const n=Math.max(1,Math.round(this.ctx.sampleRate*duration/1000));
+    const buf=this.ctx.createBuffer(2,n,this.ctx.sampleRate);
+    const target=buf.getChannelData(side==='left'?0:1);
+    const random=mulberry32(side==='left'?0xA3107:0xB6209);
 
-    const merger=this.ctx.createChannelMerger(2);
-    const leftBus=this.ctx.createGain(), rightBus=this.ctx.createGain();
+    // Stateful filtered noise + tonal air component. This is rendered into the
+    // buffer once; playback itself has no moving filters or gain automation.
+    let low=0, band=0;
+    for(let i=0;i<n;i++){
+      const t=i/this.ctx.sampleRate;
+      const p=i/Math.max(1,n-1);
+      const white=random()*2-1;
+      low += (white-low)*0.018;
+      const hp=white-low;
+      band += (hp-band)*0.12;
+      const air=band*0.72 + low*0.16;
+      const freq=105 + 185*p;
+      const tonal=Math.sin(2*Math.PI*freq*t)*(0.10+0.26*p);
+      const granular=Math.sin(2*Math.PI*(520+720*p)*t + Math.sin(2*Math.PI*7*t)*0.8)*(0.015+0.06*p);
+      const ramp=Math.pow(p,2.65);
+      const attack=Math.min(1,p/0.015);
+      const release=Math.min(1,(1-p)/0.025);
+      const env=Math.max(0,Math.min(1,attack,release));
+      target[i]=(air*0.20+tonal+granular)*ramp*env;
+    }
+    // Explicitly zero the non-target channel for every sample.
+    const other=buf.getChannelData(side==='left'?1:0);
+    other.fill(0);
+    return buf;
+  }
 
-    // HARD left/right isolation. The non-target ear receives zero signal.
-    leftBus.gain.value=side==='left'?1:0;
-    rightBus.gain.value=side==='right'?1:0;
-    leftBus.connect(merger,0,0);
-    rightBus.connect(merger,0,1);
-    merger.connect(this.master);
+  ballApproach(side,duration){
+    if(!this.ctx) throw new Error('Audio not initialized.');
+    if(this.ctx.state==='suspended') this.ctx.resume().catch(()=>{});
+    const cleanSide=side==='left'?'left':'right';
+    const cleanDuration=duration===500?500:1000;
 
-    const g=this.ctx.createGain();
-    const filter=this.ctx.createBiquadFilter();
-    const osc=this.ctx.createOscillator();
+    // Only one approach voice is allowed. A duplicate request is ignored rather
+    // than stopping/restarting the current ball.
+    if(this.currentApproach?.active) return false;
 
-    filter.type='bandpass';
-    filter.frequency.value=1500;
-    filter.Q.value=.75;
+    const id=++this.approachSerial;
+    const source=this.ctx.createBufferSource();
+    source.buffer=this._createApproachBuffer(cleanSide,cleanDuration);
+    source.connect(this.master);
 
-    // 1.0 s approach envelope. The audio routing remains hard-isolated to one ear.
-    g.gain.setValueAtTime(.0001,t);
-    g.gain.exponentialRampToValueAtTime(.035,t+Math.min(.18,sec*.10));
-    g.gain.exponentialRampToValueAtTime(.18,t+sec*.72);
-    g.gain.exponentialRampToValueAtTime(.8,t+sec);
+    const startedAt=this.ctx.currentTime;
+    const seconds=cleanDuration/1000;
+    const state={id,active:true,side:cleanSide,duration:cleanDuration,source};
+    this.currentApproach=state;
 
-    osc.type='sawtooth';
-    osc.frequency.setValueAtTime(95,t);
-    osc.frequency.exponentialRampToValueAtTime(340,t+sec);
-    osc.detune.value=side==='left'?-4:4;
-
-    // Short broadband component gives the approach a less synthetic, more ball-like texture.
-    const noise=this.ctx.createBufferSource();
-    const buf=this.ctx.createBuffer(1,Math.max(1,Math.floor(this.ctx.sampleRate*.8)),this.ctx.sampleRate);
-    const data=buf.getChannelData(0);
-    for(let i=0;i<data.length;i++) data[i]=(Math.random()*2-1)*Math.pow(1-i/data.length,1.4);
-    noise.buffer=buf;
-    const ng=this.ctx.createGain();
-    ng.gain.setValueAtTime(.0001,t);
-    ng.gain.exponentialRampToValueAtTime(.05,t+sec*.65);
-    ng.gain.exponentialRampToValueAtTime(.52,t+sec);
-
-    noise.connect(ng).connect(filter);
-    osc.connect(filter).connect(g);
-    g.connect(side==='left'?leftBus:rightBus);
-
-    // Prevent an old scheduled voice from surviving into a new point.
-    const stop=()=>{
-      if(voice!==this.activeVoice)return;
-      const now=this.ctx.currentTime;
-      try{
-        g.gain.cancelScheduledValues(now);
-        g.gain.setValueAtTime(Math.max(g.gain.value,.0001),now);
-        g.gain.exponentialRampToValueAtTime(.0001,now+.015);
-      }catch{}
-      try{noise.stop(now+.02);}catch{}
-      try{osc.stop(now+.02);}catch{}
+    source.onended=()=>{
+      if(this.currentApproach?.id===id){
+        this.currentApproach.active=false;
+        this.currentApproach=null;
+      }
     };
-
-    noise.start(t);
-    osc.start(t);
-    osc.stop(t+sec+.03);
-
-    this.current={stop};
-    return duration;
+    source.start(startedAt);
+    source.stop(startedAt+seconds);
+    return true;
   }
 
   stopApproach(){
-    if(this.current){
-      const old=this.current;
-      this.current=null;
-      try{old.stop();}catch{}
+    const a=this.currentApproach;
+    if(!a) return;
+    this.currentApproach=null;
+    a.active=false;
+    try{a.source.onended=null;}catch{}
+    try{a.source.stop();}catch{}
+  }
+
+  _oneShotStereoBuffer(kind,side,quality=0.8){
+    const sr=this.ctx.sampleRate;
+    const duration=kind==='hit'?0.18:0.16;
+    const n=Math.floor(sr*duration);
+    const buf=this.ctx.createBuffer(2,n,sr);
+    const out=buf.getChannelData(side===null?0:(side==='left'?0:1));
+    const random=mulberry32(kind==='hit'?0x51A7:0xB00D);
+    const mono=kind==='hit'?out:null;
+    if(kind==='hit'){
+      for(let i=0;i<n;i++){
+        const t=i/sr;
+        const env=Math.exp(-t/0.032);
+        const click=(random()*2-1)*0.75*env;
+        const body=Math.sin(2*Math.PI*(145-65*(t/duration))*t)*0.24*env;
+        out[i]=(click+body)*(0.65+0.35*quality);
+      }
+      const other=buf.getChannelData(side==='left'?1:0); other.fill(0);
+    } else {
+      const l=buf.getChannelData(0),r=buf.getChannelData(1);
+      for(let i=0;i<n;i++){
+        const s=(Math.random()*2-1)*Math.exp(-i/(sr*0.025))*0.10;
+        l[i]=s; r[i]=s;
+      }
     }
+    return buf;
   }
 
-  hit(side,quality=0.7){
+  hit(side,quality=0.8){
+    if(!this.ctx)return;
     this.stopApproach();
-    const t=this.ctx.currentTime;
-    const isLeft=side==='left';
-    const merger=this.ctx.createChannelMerger(2);
-    const leftBus=this.ctx.createGain(), rightBus=this.ctx.createGain();
-    leftBus.gain.value=isLeft?1:0; rightBus.gain.value=isLeft?0:1;
-    leftBus.connect(merger,0,0); rightBus.connect(merger,0,1); merger.connect(this.master);
-
-    // Tennis-ball strike: short noisy felt contact + low resonant body thump.
-    const noise=this.ctx.createBufferSource();
-    const buf=this.ctx.createBuffer(1,this.ctx.sampleRate*.15,this.ctx.sampleRate);
-    const d=buf.getChannelData(0);
-    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1)*Math.exp(-i/this.ctx.sampleRate/.032);
-    noise.buffer=buf;
-    const ng=this.ctx.createGain();
-    ng.gain.setValueAtTime(.45+.45*quality,t);
-    ng.gain.exponentialRampToValueAtTime(.0001,t+.11);
-    noise.connect(ng).connect(isLeft?leftBus:rightBus);
-    noise.start(t);
-
-    const o=this.ctx.createOscillator(),og=this.ctx.createGain();
-    o.type='sine';
-    o.frequency.setValueAtTime(145,t);
-    o.frequency.exponentialRampToValueAtTime(72,t+.16);
-    og.gain.setValueAtTime(.12+.12*quality,t);
-    og.gain.exponentialRampToValueAtTime(.0001,t+.18);
-    o.connect(og).connect(isLeft?leftBus:rightBus);
-    o.start(t); o.stop(t+.2);
+    const src=this.ctx.createBufferSource();
+    src.buffer=this._oneShotStereoBuffer('hit',side,quality);
+    src.connect(this.master); src.start();
   }
 
-  miss(){ this._tone(0,130,0.18,.12); }
+  miss(){
+    if(!this.ctx)return;
+    const src=this.ctx.createBufferSource();
+    src.buffer=this._oneShotStereoBuffer('miss',null);
+    src.connect(this.master); src.start();
+  }
 }

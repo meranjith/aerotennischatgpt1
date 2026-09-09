@@ -1,49 +1,36 @@
 export class TennisMatch {
-  constructor() {
-    this.players = [0, 0];
-    this.games = [0, 0];
-    this.server = 0;
-    this.serviceSide = 0; // 0=deuce court, 1=ad court for the starting point only; toggles each point.
-    this.pointCount = 0;
-    this.gameNumber = 1;
-  }
-
-  pointLabel() {
-    const [a,b] = this.players;
-    if (a >= 3 && b >= 3) {
-      if (a === b) return 'DEUCE';
-      return a > b ? `ADVANTAGE P1` : `ADVANTAGE P2`;
+  constructor(){this.reset();}
+  reset(){this.points=[0,0];this.games=[0,0];this.server=0;this.gameNumber=1;}
+  pointLabel(){
+    if(this.points[0]>=3&&this.points[1]>=3){
+      if(this.points[0]===this.points[1])return 'DEUCE';
+      return this.points[0]>this.points[1]?'ADVANTAGE P1':'ADVANTAGE P2';
     }
-    const labels = ['LOVE','15','30','40'];
-    return `${labels[Math.min(a,3)]} - ${labels[Math.min(b,3)]}`;
+    const l=['LOVE','15','30','40'];
+    return `${l[this.points[0]]||'40'} - ${l[this.points[1]]||'40'}`;
   }
-
-  point(winner) {
-    if (winner !== 0 && winner !== 1) throw new Error('winner must be 0 or 1');
-    const other = winner ^ 1;
-    if (this.players[winner] >= 3 && this.players[other] >= 3) {
-      if (this.players[winner] === this.players[other]) this.players[winner] += 1;
-      else if (this.players[winner] === 4 && this.players[other] === 3) {
-        this.players[winner] = 0; this.players[other] = 0;
-      } else this.players[winner] += 1;
-    } else {
-      this.players[winner] += 1;
+  point(winner){
+    if(winner!==0&&winner!==1)throw new Error('Invalid winner');
+    const loser=winner^1;
+    if(this.points[0]>=3&&this.points[1]>=3){
+      if(this.points[0]===this.points[1])this.points[winner]=4;
+      else if(this.points[winner]===4){
+        this.games[winner]++;
+        this.points=[0,0];
+        this.server^=1;
+        this.gameNumber++;
+        return {gameWon:true,matchWon:this.games[winner]>=6};
+      }else{this.points=[3,3];}
+    }else{
+      this.points[winner]++;
+      if(this.points[winner]>=4&&this.points[loser]<=2){
+        this.games[winner]++;
+        this.points=[0,0];
+        this.server^=1;
+        this.gameNumber++;
+        return {gameWon:true,matchWon:this.games[winner]>=6};
+      }
     }
-
-    this.pointCount += 1;
-    this.serviceSide ^= 1;
-
-    if (this.players[winner] >= 4 && this.players[winner] - this.players[other] >= 2) {
-      this.games[winner] += 1;
-      const gameWinner = winner;
-      this.players = [0,0];
-      this.server ^= 1;
-      this.gameNumber += 1;
-      this.serviceSide = 0;
-      return { gameWon: true, gameWinner, matchWon: this.games[gameWinner] >= 6 && this.games[gameWinner] - this.games[winner ^ 1] >= 2 };
-    }
-    return { gameWon:false, gameWinner:null, matchWon:false };
+    return {gameWon:false,matchWon:false};
   }
-
-  scoreText() { return `${this.pointLabel()} · GAMES ${this.games[0]} - ${this.games[1]}`; }
 }

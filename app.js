@@ -1,236 +1,194 @@
-import {MotionEngine} from './motion-engine.js';
-import {AudioEngine} from './audio-engine.js';
-import {TennisMatch} from './game-logic.js';
+import {MotionEngine} from './motion-engine.js?v=20260909a';
+import {AudioEngine} from './audio-engine.js?v=20260909a';
+import {TennisMatch} from './game-logic.js?v=20260909a';
+import {NORMAL_MS,FAST_MS,durationForSpeed,shotIsValidForSide,nextRandomSide,sanitizeShot} from './rally-core.js?v=20260909a';
 
 const $=id=>document.getElementById(id);
 const motion=new MotionEngine();
 const audio=new AudioEngine();
 const match=new TennisMatch();
-let wakeLock=null, mode='lobby', localPlayer=0, peer=null, conn=null, roomCode='', ballTimer=null, hitWindow=null;
-let incomingSide=null, incomingDuration=1000, impactAt=0, rallyId=0, rallyInProgress=false;
 
-function show(id){for(const el of document.querySelectorAll('.screen'))el.classList.remove('active');$(id).classList.add('active');}
-function toast(msg){const el=$('toast');el.textContent=msg;el.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>el.classList.remove('show'),2400);}
-function setEnabled(v){for(const id of ['practiceBtn','createBtn','joinBtn','calibrateBtn'])$(id).disabled=!v;}
-function updateDebug(s){$('dbgAcc').textContent=`${s.accel.x.toFixed(1)},${s.accel.y.toFixed(1)},${s.accel.z.toFixed(1)}`;$('dbgFwd').textContent=`${s.forwardAccel.toFixed(2)} / ${s.rawForwardAccel.toFixed(2)}`;$('dbgFace').textContent=`${s.face.toUpperCase()} (${s.faceDot.toFixed(2)})`;$('dbgRot').textContent=(s.rotRate||0).toFixed(2);$('dbgConf').textContent=`${s.confidence}%`;}
-function requireLandscape(){return matchMedia('(orientation:landscape)').matches;}
+const app={
+  mode:'lobby', practice:false, player:0,
+  side:null, duration:NORMAL_MS, impactAt:0,
+  pointId:0, shotSeq:0, activeBall:false,
+  peer:null, conn:null, host:false,
+  timers:{launch:null,miss:null,nextPoint:null},
+  lastResolvedPoint:-1,
+  ready:false
+};
 
-async function ensureReady(){
-  await audio.init();
-  try{await motion.requestPermission();}catch(e){toast(e.message||'Motion permission failed.');throw e;}
-  if(!motion.state.calibrated) show('screenCalibration');
-  if('wakeLock' in navigator){try{wakeLock=await navigator.wakeLock.request('screen');}catch{}}
+function clamp(v,a,b){return Math.max(a,Math.min(b,v));}
+function show(id){document.querySelectorAll('.screen').forEach(x=>x.classList.remove('active'));$(id).classList.add('active');}
+function toast(m){$('toast').textContent=m;$('toast').classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>$('toast').classList.remove('show'),2200);}
+function updateDebug(s){$('dbgAcc').textContent=s.rawForwardAccel.toFixed(2);$('dbgFwd').textContent=s.forwardAccel.toFixed(2);$('dbgFace').textContent=`${s.face.toUpperCase()} (${s.faceDot.toFixed(2)})`;$('dbgRot').textContent=(s.rotRate||0).toFixed(1);$('dbgConf').textContent=`${s.confidence||0}%`;}
+function updateScore(){
+  const label=match.pointLabel();
+  if(label==='DEUCE'){$('p1Score').textContent='40';$('p2Score').textContent='40';return;}
+  const [a,b]=label.split(' - ');$('p1Score').textContent=a?.replace('LOVE','0')||'0';$('p2Score').textContent=b?.replace('LOVE','0')||'0';
 }
+async function speak(text){if(!('speechSynthesis' in window))return;speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(text);u.rate=.9;u.pitch=.8;speechSynthesis.speak(u);}
+async function wake(){if(!('wakeLock' in navigator))return;try{window.__aeroWake=await navigator.wakeLock.request('screen');}catch{}}
+async function ensureReady(){await audio.init();await motion.requestPermission();await wake();return motion.state.calibrated;}
 
 motion.on(s=>{
   updateDebug(s);
-  if(mode==='calibrating') $('calReadout').textContent=`α ${(s.orientation.alpha||0).toFixed(0)}° · β ${(s.orientation.beta||0).toFixed(0)}° · γ ${(s.orientation.gamma||0).toFixed(0)}° · face ${s.face}`;
-  if(mode==='game' && s.swing) handleSwing();
+  if(app.mode==='calibrating')$('calReadout').textContent=`α ${(s.orientation.alpha||0).toFixed(0)}° · β ${(s.orientation.beta||0).toFixed(0)}° · γ ${(s.orientation.gamma||0).toFixed(0)}° · ${s.face.toUpperCase()} ${s.faceDot.toFixed(2)}`;
+  if(app.mode==='game' && s.swing)handleSwing();
 });
 
-async function doAudioTest(){
-  try{await audio.init();audio.stereoTest();$('audioStatus').textContent='Listen: LEFT tone, then RIGHT tone. Your earbuds must clearly separate them.';setTimeout(()=>{if(confirm('Did you clearly hear LEFT then RIGHT?')){setEnabled(true);$('audioStatus').textContent='Stereo test passed. Motion controls unlocked.';}else{$('audioStatus').textContent='Test failed. Connect stereo headphones and try again.';}},1450);}catch(e){toast(e.message);}
-}
-
-$('audioTestBtn').onclick=doAudioTest;
-$('calibrateBtn').onclick=async()=>{try{await ensureReady();mode='calibrating';show('screenCalibration');}catch{}};
-$('captureCalibrationBtn').onclick=()=>{try{motion.calibrate();mode='lobby';show('screenLobby');toast('Calibration saved: screen-forward = racket forward.');}catch(e){toast(e.message);}};
-$('cancelCalibrationBtn').onclick=()=>{mode='lobby';show('screenLobby');};
-
-$('practiceBtn').onclick=async()=>{try{await audio.init();await motion.requestPermission();if(!motion.state.calibrated){mode='calibrating';show('screenCalibration');return;}await startGame('practice',0);}catch{}};
-$('createBtn').onclick=async()=>{try{await audio.init();await motion.requestPermission();if(!motion.state.calibrated){mode='calibrating';show('screenCalibration');return;}createRoom();}catch{}};
+$('audioTestBtn').onclick=async()=>{try{await audio.init();audio.stereoTest();$('audioStatus').textContent='LEFT tone → RIGHT tone. Headphones must separate them.';setTimeout(()=>{setButtons(true);$('audioStatus').textContent='Stereo test completed.';},1450);}catch(e){toast(e.message);}};
+$('calibrateBtn').onclick=async()=>{try{await audio.init();await motion.requestPermission();show('screenCalibration');app.mode='calibrating';}catch(e){toast(e.message);}};
+$('captureCalibrationBtn').onclick=()=>{try{motion.calibrate();app.mode='lobby';show('screenLobby');toast('Calibration saved. Screen-forward is your neutral racket pose.');}catch(e){toast(e.message);}};
+$('cancelCalibrationBtn').onclick=()=>{app.mode='lobby';show('screenLobby');};
+$('debugBtn').onclick=()=>$('debugPanel').classList.toggle('hidden');
+$('quitBtn').onclick=()=>stopGame();
+$('practiceBtn').onclick=async()=>{try{if(!motion.state.calibrated){if(!await ensureReady()){show('screenCalibration');app.mode='calibrating';return;}}else await audio.init();startPractice();}catch(e){toast(e.message);}};
+$('createBtn').onclick=async()=>{try{if(!motion.state.calibrated){if(!await ensureReady()){show('screenCalibration');app.mode='calibrating';return;}}else await audio.init();startHost();}catch(e){toast(e.message);}};
 $('joinBtn').onclick=()=>{$('joinBox').classList.toggle('hidden');$('roomInput').focus();};
-$('confirmJoinBtn').onclick=async()=>{const code=$('roomInput').value.replace(/\D/g,'');if(code.length!==6){toast('Enter a 6-digit code.');return;}try{await audio.init();await motion.requestPermission();if(!motion.state.calibrated){mode='calibrating';show('screenCalibration');return;}joinRoom(code);}catch{}};
-$('debugBtn').onclick=()=>{$('debugPanel').classList.toggle('hidden');};
-$('quitBtn').onclick=()=>{stopGame();show('screenLobby');};
+$('confirmJoinBtn').onclick=async()=>{const code=$('roomInput').value.replace(/\D/g,'');if(code.length!==6)return toast('Enter a 6-digit code.');try{if(!motion.state.calibrated){if(!await ensureReady()){show('screenCalibration');app.mode='calibrating';return;}}else await audio.init();startJoin(code);}catch(e){toast(e.message);}};
 
-function randomCode(){return String(Math.floor(Math.random()*1e6)).padStart(6,'0');}
-function initPeer(id,host=false){
-  if(typeof Peer==='undefined'){toast('Peer connection library unavailable.');return;}
-  peer=new Peer(id,{debug:0});
-  peer.on('open',()=>{if(host){roomCode=id.slice(-6);$('roomCode').textContent=roomCode;$('roomBox').classList.remove('hidden');$('roomStatus').textContent='Waiting for Player 2…';}});
-  peer.on('connection',c=>{if(conn){c.close();return;}conn=c;localPlayer=0;wireConnection();});
-  peer.on('error',e=>toast(`Connection: ${e.type||e.message||'error'}`));
+function setButtons(v){['practiceBtn','createBtn','joinBtn','calibrateBtn'].forEach(id=>$(id).disabled=!v);}
+function clearTimers(){for(const k of Object.keys(app.timers))clearTimeout(app.timers[k]);app.timers={launch:null,miss:null,nextPoint:null};audio.stopApproach();}
+function setGameLabels(){ $('modeLabel').textContent=app.practice?'WALL MODE':'LIVE MATCH';$('p1Name').textContent='P1';$('p2Name').textContent=app.practice?'WALL':'P2';updateScore(); }
+function prepareGame(){
+  clearTimers();
+  try{screen.orientation?.lock?.('landscape').catch?.(()=>{});}catch{}match.reset();app.pointId=0;app.shotSeq=0;app.lastResolvedPoint=-1;app.activeBall=false;app.side=null;app.duration=NORMAL_MS;
+  app.mode='game';show('screenGame');setGameLabels();$('serveLabel').textContent='PLAYER 1 TO SERVE';
 }
-function wireConnection(){
-  if(!conn)return;
-  conn.on('open',()=>{mode='game';show('screenGame');$('modeLabel').textContent='LIVE MATCH';$('serveLabel').textContent='PLAYER 1 TO SERVE';toast('Peer connection established.');if(localPlayer===1 && conn.open)conn.send({type:'ready'});if(localPlayer===0)beginPoint();});
-  conn.on('data',msg=>{
-    if(msg?.type==='point'){resolvePoint(msg.winner,true);return;}
-    if(msg?.type==='rally'){startRemoteBall(msg.side,1000,msg.id);return;}
-    if(msg?.type==='shot'){startRemoteBall(msg.side,msg.duration,msg.id);return;}
-    if(msg?.type==='ready'){if(localPlayer===0)beginPoint();}
-  });
-}
-function createRoom(){
-  const code=randomCode(); roomCode=code; initPeer(`aerotennis-${code}` ,true); $('roomBox').classList.remove('hidden'); $('roomCode').textContent=code; $('roomStatus').textContent='Waiting for Player 2…'; toast(`Match code ${code}`);
-}
-function joinRoom(code){
-  roomCode=code; peer=new Peer(undefined,{debug:0}); peer.on('open',()=>{conn=peer.connect(`aerotennis-${code}`,{reliable:true});localPlayer=1;wireConnection();}); peer.on('error',e=>toast('Could not join that room. Check the code and host status.'));
+async function startPractice(){app.practice=true;app.player=0;app.host=false;app.conn=null;app.peer=null;prepareGame();await speak('Wall mode ready.');queuePracticeBall(NORMAL_MS);}
+
+function queuePracticeBall(duration){
+  clearTimeout(app.timers.launch);clearTimeout(app.timers.miss);audio.stopApproach();
+  const side=nextRandomSide();
+  app.timers.launch=setTimeout(()=>startBall(side,duration),620);
 }
 
-async function startGame(newMode,player){
-  mode='game';localPlayer=player;show('screenGame');$('modeLabel').textContent=newMode==='practice'?'WALL MODE':'LIVE MATCH';$('p1Name').textContent='P1';$('p2Name').textContent=newMode==='practice'?'WALL':'P2';updateScore();await speak(`Ready. ${localPlayer===0?'Player 1':'Player 2'} to serve.`);beginPoint();}
-function updateScore(){ $('p1Score').textContent=match.pointLabel().split(' - ')[0].replace('LOVE','0').replace('15','15').replace('30','30').replace('40','40').replace('DEUCE','40').replace('ADVANTAGE P1','40'); $('p2Score').textContent=match.pointLabel().split(' - ')[1]?.replace('LOVE','0').replace('15','15').replace('30','30').replace('40','40').replace('ADVANTAGE P2','40')||'40'; }
-async function speak(t){ if(!('speechSynthesis' in window))return; speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=.88;u.pitch=.78;speechSynthesis.speak(u); }
-function beginPoint(sideOverride=null, remoteStart=false){
-  clearTimeout(ballTimer); clearTimeout(hitWindow); audio.stopApproach();
-  $('audioState').textContent='LISTEN'; $('directionState').textContent='—';
-  if(mode!=='game')return;
-
-  // KEEP THIS PRACTICE/TRAINING PATH UNCHANGED:
-  // random side, 1-second approach, local hit detection.
-  const side=sideOverride || (Math.random()<.5?'left':'right');$('directionState').textContent=side.toUpperCase();
-  const delay=remoteStart ? 120 : 900+Math.random()*900;
-
-  // Only an actual multiplayer host sends the initial ball.
-  if(!remoteStart && conn?.open) conn.send({type:'rally',side,id:++rallyId});
-
-  ballTimer=setTimeout(()=>{
-    incomingSide=side;
-    incomingDuration=1000;
-    impactAt=performance.now()+1000;
-    rallyInProgress=Boolean(conn?.open);
-    audio.ballApproach(side,1000);
-    $('audioState').textContent='BALL APPROACHING';
-    $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:1000,easing:'cubic-bezier(.2,.8,.1,1)'});
-    hitWindow=setTimeout(()=>resolvePoint(null,false,side),1360);
-    beginPoint.side=side;
-    beginPoint.impactAt=impactAt;
-  },delay);
-}
-
-function startRemoteBall(side,duration,id){
-  if(mode!=='game' || !conn?.open)return;
-
-  clearTimeout(ballTimer);
-  clearTimeout(hitWindow);
+function startBall(side,duration){
+  if(app.mode!=='game')return;
+  clearTimeout(app.timers.miss);
   audio.stopApproach();
-
-  const cleanSide=side==='left'?'left':'right';
-  const cleanDuration=Number(duration)===500 ? 500 : 1000;
-
-  incomingSide=cleanSide;
-  incomingDuration=cleanDuration;
-  impactAt=performance.now()+cleanDuration;
-  rallyInProgress=true;
-  rallyId=id ?? rallyId;
-  beginPoint.side=cleanSide;
-  beginPoint.impactAt=impactAt;
-
+  app.side=side==='left'?'left':'right';
+  app.duration=duration===FAST_MS?FAST_MS:NORMAL_MS;
+  app.impactAt=performance.now()+app.duration;
+  app.activeBall=true;
   $('audioState').textContent='BALL APPROACHING';
-  $('directionState').textContent=cleanSide.toUpperCase();
-  audio.ballApproach(cleanSide,cleanDuration);
-  $('pulse').animate([
-    {transform:'scale(.55)',opacity:.12},
-    {transform:'scale(1.05)',opacity:.5}
-  ],{
-    duration:cleanDuration,
-    easing:'cubic-bezier(.2,.8,.1,1)'
-  });
-
-  // Give the receiver a small grace period after the impact time before
-  // declaring a miss; this is independent of shot speed and does not alter
-  // the required 500/1000 ms approach duration.
-  hitWindow=setTimeout(
-    ()=>resolvePoint(null,false,cleanSide),
-    cleanDuration+360
-  );
-}
-
-function isFastSwing(ev){
-  // IMPORTANT: this is a classification only. The actual swing detector and
-  // face/side mechanics remain in motion-engine.js and are not modified.
-  const forward=Math.max(0,Number(ev?.forwardAccel)||0);
-  return forward>=5.5;
+  $('directionState').textContent=app.side.toUpperCase();
+  audio.ballApproach(app.side,app.duration);
+  $('pulse').animate([{transform:'scale(.55)',opacity:.12},{transform:'scale(1.05)',opacity:.5}],{duration:app.duration,easing:'ease-out'});
+  app.timers.miss=setTimeout(()=>receiverMiss(),app.duration+320);
 }
 
 function handleSwing(){
-  const ev=motion.consumeSwing();
-  if(!ev)return;
-
-  // Keep using the exact working swing discrimination.
-  const side=beginPoint.side;
-  if(!side)return;
-
-  const faceDot=Number.isFinite(ev.faceDot)?ev.faceDot:0;
-  const now=performance.now();
-  const pointImpactAt=beginPoint.impactAt||now;
-  const dt=Math.abs((ev.t||now)-pointImpactAt);
-
-  const requiredFace=side==='right' ? 1 : -1;
-  const faceDotThreshold=0.20;
-  const correctFace=requiredFace===1
-    ? faceDot>=faceDotThreshold
-    : faceDot<=-faceDotThreshold;
-
-  const timingWindowMs=800;
-  const timingScore=clampNumber(1-(dt/timingWindowMs),0,1);
-  const valid=correctFace && timingScore>0.04;
-
-  if(!valid){
-    audio.miss();
-    if(!correctFace){
-      $('audioState').textContent=side==='left'
-        ? `MISS — BACKHAND REQUIRED (face ${faceDot.toFixed(2)})`
-        : `MISS — FOREHAND REQUIRED (face ${faceDot.toFixed(2)})`;
-    }else{
-      $('audioState').textContent='MISS — TOO EARLY / LATE';
-    }
-    setTimeout(()=>beginPoint(),800);
+  if(!app.activeBall || !app.side)return;
+  const swing=motion.consumeSwing();
+  if(!swing)return;
+  const faceOK=shotIsValidForSide(app.side,swing.face);
+  const dt=Math.abs(swing.t-app.impactAt);
+  const timingOK=dt<=Math.max(240,app.duration*.45);
+  if(!faceOK || !timingOK){
+    app.activeBall=false;clearTimeout(app.timers.miss);audio.stopApproach();audio.miss();
+    $('audioState').textContent=!faceOK?'MISS — WRONG RACKET FACE':'MISS — TOO EARLY / LATE';
+    receiverMiss();
     return;
   }
 
-  // PRACTICE MODE: preserve the known-good behavior exactly.
-  if(!conn?.open){
-    audio.hit(side,ev.quality);
-    $('audioState').textContent=side==='right'?'FOREHAND HIT':'BACKHAND HIT';
-    resolvePoint(localPlayer,false,side,true);
+  app.activeBall=false;clearTimeout(app.timers.miss);audio.stopApproach();audio.hit(app.side,swing.quality);
+  const speed=swing.speed==='fast'?'fast':'normal';
+  const nextDuration=durationForSpeed(speed);
+  $('audioState').textContent=`${app.side==='right'?'FOREHAND':'BACKHAND'} · ${speed.toUpperCase()}`;
+
+  if(app.practice){
+    app.timers.nextPoint=setTimeout(()=>queuePracticeReturn(nextDuration),230);
+  }else{
+    const nextSide=nextRandomSide();
+    app.shotSeq++;
+    sendPeer({type:'SHOT',pointId:app.pointId,seq:app.shotSeq,target:app.player^1,side:nextSide,speed,duration:nextDuration});
+  }
+}
+function queuePracticeReturn(duration){
+  const side=nextRandomSide();
+  startBall(side,duration);
+}
+function receiverMiss(){
+  if(app.practice){
+    app.timers.nextPoint=setTimeout(()=>queuePracticeBall(NORMAL_MS),700);
     return;
   }
+  const winner=app.player^1;
+  // Resolve locally first so both peers update immediately; the remote copy
+  // is idempotent because resolvePointRemote guards on pointId.
+  if(app.lastResolvedPoint!==app.pointId) resolvePointRemote(winner);
+  sendPeer({type:'POINT',pointId:app.pointId,winner});
+}
 
-  // LIVE MULTIPLAYER ONLY:
-  // successful hit transfers the ball instead of ending the point.
-  // Normal = exactly 1000 ms, Fast = exactly 500 ms.
-  const nextDuration=isFastSwing(ev)?500:1000;
-  const nextSide=Math.random()<0.5?'left':'right';
-  const nextId=(rallyId||0)+1;
-  rallyId=nextId;
-
-  audio.hit(side,ev.quality);
-  $('audioState').textContent=
-    `${side==='right'?'FOREHAND':'BACKHAND'} HIT · ${nextDuration===500?'FAST':'NORMAL'}`;
-
-  clearTimeout(ballTimer);
-  clearTimeout(hitWindow);
-  audio.stopApproach();
-  incomingSide=null;
-  incomingDuration=nextDuration;
-  impactAt=0;
-  rallyInProgress=true;
-
-  conn.send({
-    type:'shot',
-    side:nextSide,
-    duration:nextDuration,
-    id:nextId
+function randomCode(){return String(Math.floor(Math.random()*1e6)).padStart(6,'0');}
+function startHost(){
+  app.practice=false;app.host=true;app.player=0;app.pointId=0;app.shotSeq=0;
+  const code=randomCode();$('roomCode').textContent=code;$('roomBox').classList.remove('hidden');$('roomStatus').textContent='Waiting for Player 2…';
+  app.peer=new Peer(`aero2v2-${code}`,{debug:0});
+  app.peer.on('connection',c=>{if(app.conn){c.close();return;}app.conn=c;wireConnection();});
+  app.peer.on('error',e=>toast(`Connection: ${e.type||e.message||'error'}`));
+}
+function startJoin(code){
+  app.practice=false;app.host=false;app.player=1;
+  app.peer=new Peer(undefined,{debug:0});
+  app.peer.on('open',()=>{app.conn=app.peer.connect(`aero2v2-${code}`,{reliable:true,serialization:'json'});wireConnection();});
+  app.peer.on('error',()=>toast('Could not join the room.'));
+}
+function wireConnection(){
+  app.conn.on('open',async()=>{
+    app.ready=true;prepareGame();$('serveLabel').textContent='PLAYER 1 TO SERVE';toast('Players connected.');
+    if(app.host){await speak('Player 1 to serve.');beginPointAsServer();}
   });
+  app.conn.on('data',msg=>onPeerMessage(msg));
+  app.conn.on('close',()=>toast('Opponent disconnected.'));
+}
+function beginPointAsServer(){
+  if(app.mode!=='game'||!app.host)return;
+  app.pointId+=1;app.shotSeq=0;
+  const side=nextRandomSide();
+  $('serveLabel').textContent=`${match.server===0?'PLAYER 1':'PLAYER 2'} TO SERVE`;
+  if(match.server===app.player){
+    startBall(side,NORMAL_MS);
+  }else{
+    sendPeer({type:'SERVE',pointId:app.pointId,target:match.server,side,duration:NORMAL_MS});
+  }
+}
+function sendPeer(m){if(app.conn?.open)app.conn.send(m);}
+function onPeerMessage(raw){
+  if(app.mode!=='game'||!raw)return;
+  if(raw.type==='SERVE'){
+    if(raw.target!==app.player||raw.pointId<app.pointId)return;
+    app.pointId=raw.pointId;app.shotSeq=0;startBall(raw.side,NORMAL_MS);return;
+  }
+  if(raw.type==='SHOT'){
+    const msg=sanitizeShot(raw);
+    if(msg.target!==app.player||msg.pointId!==app.pointId)return;
+    if(msg.seq<=app.shotSeq)return;
+    app.shotSeq=msg.seq;startBall(msg.side,msg.duration);return;
+  }
+  if(raw.type==='POINT'){
+    if(raw.pointId!==app.pointId||raw.pointId===app.lastResolvedPoint)return;
+    resolvePointRemote(raw.winner);return;
+  }
+}
+function resolvePointRemote(winner){
+  if(app.lastResolvedPoint===app.pointId)return;
+  app.lastResolvedPoint=app.pointId;clearTimers();app.activeBall=false;
+  const result=match.point(winner);updateScore();
+  $('audioState').textContent=winner===app.player?'POINT WON':'POINT LOST';
+  $('serveLabel').textContent=`${match.server===0?'PLAYER 1':'PLAYER 2'} TO SERVE`;
+  if(result.matchWon){speak(`${winner===0?'Player 1':'Player 2'} wins the match.`);return;}
+  app.timers.nextPoint=setTimeout(()=>{if(app.host)beginPointAsServer();},1150);
+}
+function stopGame(){
+  clearTimers();app.mode='lobby';app.practice=false;app.activeBall=false;show('screenLobby');
+  try{app.conn?.close();app.peer?.destroy();}catch{}
+  app.conn=null;app.peer=null;
+  if(window.__aeroWake){window.__aeroWake.release().catch(()=>{});window.__aeroWake=null;}
 }
 
-function clampNumber(v,a,b){return Math.max(a,Math.min(b,v));}
-function resolvePoint(winner,remote=false,side=null,hit=false){
-  clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();
-  incomingSide=null; incomingDuration=1000; impactAt=0; rallyInProgress=false;
-  if(winner===null){audio.miss();$('audioState').textContent='MISS';setTimeout(beginPoint,850);return;}
-  const result=match.point(winner);updateScore();$('audioState').textContent=hit?'CLEAN HIT':'POINT';$('directionState').textContent=side?side.toUpperCase():'—';
-  if(!remote&&conn?.open)conn.send({type:'point',winner});
-  const winnerText=winner===0?'Player 1':'Player 2';
-  if(result.gameWon){$('serveLabel').textContent=`${winnerText} WON THE GAME · ${match.server===0?'PLAYER 1':'PLAYER 2'} SERVES`;
-    if(result.matchWon){speak(`${winnerText} wins the match.`);return;}
-  } else $('serveLabel').textContent=`${match.pointLabel()} · ${match.server===0?'PLAYER 1':'PLAYER 2'} TO SERVE`;
-  setTimeout(()=>{if(mode==='game')beginPoint();},1150);
-}
-function stopGame(){mode='lobby';clearTimeout(ballTimer);clearTimeout(hitWindow);audio.stopApproach();incomingSide=null;incomingDuration=1000;impactAt=0;rallyInProgress=false;if(wakeLock){wakeLock.release().catch(()=>{});wakeLock=null;}if(conn){try{conn.close()}catch{}}if(peer){try{peer.destroy()}catch{}}conn=null;peer=null;roomCode='';$('joinBox').classList.add('hidden');$('roomBox').classList.add('hidden');}
-
-// Register PWA service worker only on HTTPS (GitHub Pages is HTTPS).
-if('serviceWorker' in navigator && location.protocol==='https:') navigator.serviceWorker.register('./sw.js').catch(()=>{});
+// Keep AudioContext awake after focus/visibility changes.
+document.addEventListener('visibilitychange',()=>{if(!document.hidden)audio.resume().catch(()=>{});},{passive:true});
+window.addEventListener('focus',()=>audio.resume().catch(()=>{}),{passive:true});
